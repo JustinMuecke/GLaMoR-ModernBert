@@ -7,8 +7,10 @@ from tqdm import tqdm
 from torch.optim import AdamW
 from torch import nn
 import logging
-logger = logging.getLogger("modern Bert")
 from sklearn.metrics import precision_score, recall_score
+import wandb
+
+logger = logging.getLogger("modern Bert")
 
 def load_data():
     train_df = pd.read_csv("../data/train_data.csv", header=0)
@@ -63,7 +65,7 @@ def tokenize_data(tokenizer, data, max_input_length=4096):
 
 
 
-def run_train_epoch(model, data, criterion, optimizer, batch_size, gradient_accumulation_steps, device):
+def run_train_epoch(model, data,  optimizer,  gradient_accumulation_steps, device):
     model.train()
     total_loss = 0
     total_accuracy = 0
@@ -95,7 +97,7 @@ def run_train_epoch(model, data, criterion, optimizer, batch_size, gradient_accu
     return avg_loss, avg_accuracy
 
 
-def run_eval_epoch(model, data, batch_size, gradient_accumulation_steps, device):
+def run_eval_epoch(model, data,  gradient_accumulation_steps, device):
     model.eval()
     total_loss = 0
     all_preds = []
@@ -162,16 +164,68 @@ def main(batch_size, device):
     best_eval_recall = 0
     best_eval_precision = 0
 
+    stopped_early = False
+    last_epoch = 0
 
     print("TRAINING")
     for epoch in range(50):
-        train_loss, train_accuracy = run_train_epoch(model=model, data=train_data, optimizer=optimizer, batch_size=batch_size, gradient_accumulation_steps=1, device=device)
+        train_loss, train_accuracy = run_train_epoch(model=model, data=train_data, optimizer=optimizer,  gradient_accumulation_steps=1, device=device)
         logging.info(f'train - {epoch = } # {train_loss = :.2f} # {train_accuracy = :.2f}')
+        eval_loss, eval_accuracy, eval_precision, eval_recall = run_eval_epoch(model=model, data=eval_data,  gradient_accumulation_steps=1, device=device)
+        logging.info(f'dev   - {epoch = } # {eval_loss = :.2f} # {eval_accuracy = :.2f}')
 
+        # get test scores
+        test_loss, test_accuracy, test_precision, test_recall = run_eval_epoch(model=model, data=test_data,  gradient_accumulation_steps=1, device=device)
+        logging.info(f'test  - {epoch = } # {test_loss = :.2f} # {test_accuracy = :.2f}')
+
+        if eval_loss < best_eval_loss:
+            best_epoch = epoch
+            best_eval_accuracy = eval_accuracy
+            best_eval_loss = eval_loss
+            best_eval_precision = eval_precision
+            best_eval_recall = eval_recall
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "best_epoch": best_epoch,
+                "stopped_early": float(stopped_early),
+                "train/accuracy": train_accuracy, "train/loss": train_loss, 
+                "eval/accuracy": eval_accuracy, "eval/precision" : eval_precision, "eval/recall" : eval_recall, "eval/loss": eval_loss, 
+                "eval/best_accuracy": best_eval_accuracy, "eval/best_precision":best_eval_precision, "eval/best_recall" : best_eval_recall, "eval/best_loss": best_eval_loss,
+                "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
+            }
+        )
+
+        last_epoch = epoch
+        if epoch - best_epoch >= 5:
+            logging.info(f'stopped early at epoch {epoch}')
+            stopped_early = True
+            break
+
+    for epoch in range(last_epoch+1, 50):
+        wandb.log(
+            {
+                "epoch": epoch,
+                "best_epoch": best_epoch,
+                "stopped_early": float(stopped_early),
+                "train/accuracy": train_accuracy, "train/loss": train_loss, 
+                "eval/accuracy": eval_accuracy, "eval/precision" : eval_precision, "eval/recall" : eval_recall, "eval/loss": eval_loss, 
+                "eval/best_accuracy": best_eval_accuracy, "eval/best_precision":best_eval_precision, "eval/best_recall" : best_eval_recall, "eval/best_loss": best_eval_loss,
+                "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
+            }
+        )
 
 
 if __name__ == "__main__": 
     batch_size = 1
-    device = "cpu" 
+    device = "cuda:3" 
+
+    name = f'modernBert'
+    wandb_run = wandb.init(
+        project="ModernBert",
+        name=name,
+        # Track hyperparameters and run metadata
+    )
     main(batch_size, device)
 
