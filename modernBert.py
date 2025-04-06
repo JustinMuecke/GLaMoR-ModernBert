@@ -8,6 +8,7 @@ from torch.optim import AdamW
 from torch import nn
 import logging
 logger = logging.getLogger("modern Bert")
+from sklearn.metrics import precision_score, recall_score
 
 def load_data():
     train_df = pd.read_csv("../data/train_data.csv", header=0)
@@ -70,9 +71,9 @@ def run_train_epoch(model, data, criterion, optimizer, batch_size, gradient_accu
     step = 0
     for i in tqdm(range(0, data_points)):
         step += 1
-        input_ids = data["inputs_ids"][i]
-        attention_mask = data["attention_mask"][i]
-        labels = data["label"][i]
+        input_ids = data["input_ids"][i].unsqueeze(0).to(device)
+        attention_mask = data["attention_mask"][i].unsqueeze(0).to(device)
+        labels = data["labels"][i].unsqueeze(0).to(device)
 
         output = model(input_ids = input_ids, attention_mask = attention_mask, labels = labels)
         logits = output.logits
@@ -83,8 +84,7 @@ def run_train_epoch(model, data, criterion, optimizer, batch_size, gradient_accu
         optimizer.zero_grad()
 
         preds = logits.argmax().item()
-        accuracy = (preds == labels).float().mean().item()
-
+        accuracy = (preds == labels.item())
         total_loss += loss.item()
         total_accuracy += accuracy
 
@@ -95,6 +95,48 @@ def run_train_epoch(model, data, criterion, optimizer, batch_size, gradient_accu
     return avg_loss, avg_accuracy
 
 
+def run_eval_epoch(model, data, batch_size, gradient_accumulation_steps, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    total_accuracy = 0
+    num_batches = len(data["input_ids"])
+
+    for i in tqdm(range(0, num_batches)):
+        input_ids = data["input_ids"][i]
+        attention_mask = data["attention_mask"][i]
+        labels = data["labels"][i]
+
+        if len(input_ids.shape) == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if len(attention_mask.shape) == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        labels = labels.unsqueeze(0)
+
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        labels = labels.to(device)
+
+        with torch.no_grad():
+            output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = output.loss
+            logits = output.logits
+
+        preds = logits.argmax(dim=-1).item()
+        accuracy = (preds == labels.item())
+
+        total_loss += loss.item()
+        total_accuracy += accuracy
+
+        all_preds.append(preds)
+        all_labels.append(labels.item())
+
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    avg_loss = total_loss / num_batches
+
+    return avg_loss, precision, recall
 
 
 def main(batch_size, device):
@@ -111,9 +153,7 @@ def main(batch_size, device):
     eval_data = tokenize_data(tokenizer, data["eval"])
     test_data = tokenize_data(tokenizer, data["test"])
 
-    model = ModernBertForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=2)
-
-    criterion = nn.BCEWithLogitsLoss()
+    model = ModernBertForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=2).to(device)
     optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
     best_epoch = 0 
