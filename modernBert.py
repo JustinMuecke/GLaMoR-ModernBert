@@ -9,9 +9,9 @@ from torch import nn
 import logging
 from sklearn.metrics import precision_score, recall_score
 import wandb
-
-logger = logging.getLogger("modern Bert")
-
+import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
+from datetime import datetime
 def load_data():
     train_df = pd.read_csv("../data/train_data.csv", header=0)
     eval_df = pd.read_csv("../data/eval_data.csv", header=0)
@@ -56,8 +56,8 @@ def tokenize_data(tokenizer, data, max_input_length=4096):
             truncation=True,
             return_tensors="pt"
         )
-        model_inputs["input_ids"].append(encoding.input_ids)
-        model_inputs["attention_mask"].append(encoding.attention_mask)
+        model_inputs["input_ids"].append(encoding.input_ids.squeeze())
+        model_inputs["attention_mask"].append(encoding.attention_mask.squeeze())
 
     labels = torch.tensor(target_labels, dtype=torch.long)
     model_inputs["labels"] = labels
@@ -65,17 +65,32 @@ def tokenize_data(tokenizer, data, max_input_length=4096):
 
 
 
-def run_train_epoch(model, data,  optimizer,  gradient_accumulation_steps, device):
+def run_train_epoch(model, data, batch_size, optimizer,  gradient_accumulation_steps, device):
     model.train()
     total_loss = 0
     total_accuracy = 0
     data_points = int(len(data["input_ids"]))
     step = 0
-    for i in tqdm(range(0, data_points)):
+
+    input_ids = torch.stack(data["input_ids"]) if isinstance(data["input_ids"][0], torch.Tensor) else torch.tensor(data["input_ids"])
+    attention_mask = torch.stack(data["attention_mask"]) if isinstance(data["attention_mask"][0], torch.Tensor) else torch.tensor(data["attention_mask"])
+    labels = torch.tensor(data["labels"])
+
+    dataset = TensorDataset(input_ids, attention_mask, labels)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    for batch in tqdm(dataloader):
+#    for i in tqdm(range(50)):
         step += 1
-        input_ids = data["input_ids"][i].unsqueeze(0).to(device)
-        attention_mask = data["attention_mask"][i].unsqueeze(0).to(device)
-        labels = data["labels"][i].unsqueeze(0).to(device)
+#        input_ids = data["input_ids"][i].unsqueeze(0).to(device)
+#        attention_mask = data["attention_mask"][i].unsqueeze(0).to(device)
+#        labels = data["labels"][i].unsqueeze(0).to(device)
+
+        input_ids, attention_mask, labels = [x.to(device) for x in batch]
+
+        assert input_ids.dim() ==2 , f"Input Ids mask shape is {input_ids.shape}"
+        assert attention_mask.dim() == 2, f"Attention mask shape is {attention_mask.shape}"
+        assert labels.dim() ==1, f"Labels mask shape is {labels.shape}"
 
         output = model(input_ids = input_ids, attention_mask = attention_mask, labels = labels)
         logits = output.logits
@@ -85,8 +100,9 @@ def run_train_epoch(model, data,  optimizer,  gradient_accumulation_steps, devic
         optimizer.step()
         optimizer.zero_grad()
 
-        preds = logits.argmax().item()
-        accuracy = (preds == labels.item())
+        preds = logits.argmax(dim=-1)
+        accuracy = (preds == labels).float().mean().item()
+
         total_loss += loss.item()
         total_accuracy += accuracy
 
@@ -96,8 +112,7 @@ def run_train_epoch(model, data,  optimizer,  gradient_accumulation_steps, devic
 
     return avg_loss, avg_accuracy
 
-
-def run_eval_epoch(model, data,  gradient_accumulation_steps, device):
+def run_eval_epoch(model, data, gradient_accumulation_steps, device):
     model.eval()
     total_loss = 0
     all_preds = []
@@ -105,43 +120,56 @@ def run_eval_epoch(model, data,  gradient_accumulation_steps, device):
     total_accuracy = 0
     num_batches = len(data["input_ids"])
 
-    for i in tqdm(range(0, num_batches)):
-        input_ids = data["input_ids"][i]
-        attention_mask = data["attention_mask"][i]
-        labels = data["labels"][i]
+#    for i in tqdm(range(20)):
+    for i in tqdm(range(num_batches)):
+        # Get the input data for the current batch (batch size is 1)
+        input_ids = data["input_ids"][i].unsqueeze(0).to(device)  # Adding a batch dimension
+        attention_mask = data["attention_mask"][i].unsqueeze(0).to(device)  # Adding a batch dimension
+        labels = data["labels"][i].unsqueeze(0).to(device)  # Adding a batch dimension
 
+        # Ensure correct dimensions (although the above should ensure this)
         if len(input_ids.shape) == 1:
             input_ids = input_ids.unsqueeze(0)
         if len(attention_mask.shape) == 1:
             attention_mask = attention_mask.unsqueeze(0)
         labels = labels.unsqueeze(0)
 
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        labels = labels.to(device)
-
+        # No gradient calculation during evaluation
         with torch.no_grad():
             output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = output.loss
             logits = output.logits
 
-        preds = logits.argmax(dim=-1).item()
-        accuracy = (preds == labels.item())
+        # Get predictions (for batch size 1, we just pick the index of the highest logit)
+        preds = logits.argmax().item()  # Get the index of the highest logit as a scalar
 
+        # Calculate accuracy for this batch (since batch size = 1, it's binary)
+        accuracy = (preds == labels.item())  # Check if the prediction matches the label
+
+        # Accumulate total loss and accuracy
         total_loss += loss.item()
         total_accuracy += accuracy
 
+        # Append the predictions and labels for precision/recall calculation
         all_preds.append(preds)
         all_labels.append(labels.item())
 
-    precision = precision_score(all_labels, all_preds)
-    recall = recall_score(all_labels, all_preds)
+    # Move to CPU for precision and recall calculation
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    # Calculate overall precision and recall using scikit-learn
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    
+    # Calculate average loss and accuracy
     avg_loss = total_loss / num_batches
+    avg_accuracy = total_accuracy / num_batches
 
-    return avg_loss, precision, recall
+    return avg_loss, avg_accuracy, precision, recall
 
 
-def main(batch_size, device):
+def main(batch_size, device, lr, wd):
 
     graphs, labels, _ = load_data()
 
@@ -156,7 +184,7 @@ def main(batch_size, device):
     test_data = tokenize_data(tokenizer, data["test"])
 
     model = ModernBertForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=2).to(device)
-    optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
     best_epoch = 0 
     best_eval_accuracy = 0
@@ -168,15 +196,18 @@ def main(batch_size, device):
     last_epoch = 0
 
     print("TRAINING")
+    train_start = datetime.now()
     for epoch in range(50):
-        train_loss, train_accuracy = run_train_epoch(model=model, data=train_data, optimizer=optimizer,  gradient_accumulation_steps=1, device=device)
+        print("Train Step...")
+        train_loss, train_accuracy = run_train_epoch(model=model, data=train_data, batch_size=batch_size, optimizer=optimizer,  gradient_accumulation_steps=1, device=device)
         logging.info(f'train - {epoch = } # {train_loss = :.2f} # {train_accuracy = :.2f}')
+        print("Val Step...")
         eval_loss, eval_accuracy, eval_precision, eval_recall = run_eval_epoch(model=model, data=eval_data,  gradient_accumulation_steps=1, device=device)
         logging.info(f'dev   - {epoch = } # {eval_loss = :.2f} # {eval_accuracy = :.2f}')
 
         # get test scores
-        test_loss, test_accuracy, test_precision, test_recall = run_eval_epoch(model=model, data=test_data,  gradient_accumulation_steps=1, device=device)
-        logging.info(f'test  - {epoch = } # {test_loss = :.2f} # {test_accuracy = :.2f}')
+        #test_loss, test_accuracy, test_precision, test_recall = run_eval_epoch(model=model, data=test_data,  gradient_accumulation_steps=1, device=device)
+        #logging.info(f'test  - {epoch = } # {test_loss = :.2f} # {test_accuracy = :.2f}')
 
         if eval_loss < best_eval_loss:
             best_epoch = epoch
@@ -193,7 +224,7 @@ def main(batch_size, device):
                 "train/accuracy": train_accuracy, "train/loss": train_loss, 
                 "eval/accuracy": eval_accuracy, "eval/precision" : eval_precision, "eval/recall" : eval_recall, "eval/loss": eval_loss, 
                 "eval/best_accuracy": best_eval_accuracy, "eval/best_precision":best_eval_precision, "eval/best_recall" : best_eval_recall, "eval/best_loss": best_eval_loss,
-                "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
+         #       "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
             }
         )
 
@@ -202,7 +233,7 @@ def main(batch_size, device):
             logging.info(f'stopped early at epoch {epoch}')
             stopped_early = True
             break
-
+        train_end = datetime.now()
     for epoch in range(last_epoch+1, 50):
         wandb.log(
             {
@@ -212,20 +243,35 @@ def main(batch_size, device):
                 "train/accuracy": train_accuracy, "train/loss": train_loss, 
                 "eval/accuracy": eval_accuracy, "eval/precision" : eval_precision, "eval/recall" : eval_recall, "eval/loss": eval_loss, 
                 "eval/best_accuracy": best_eval_accuracy, "eval/best_precision":best_eval_precision, "eval/best_recall" : best_eval_recall, "eval/best_loss": best_eval_loss,
-                "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
+          #      "test/accuracy": test_accuracy, "test/precision" : test_precision, "test/recall" : test_recall, "test/loss": test_loss, 
             }
         )
-
-
+        inf_start = datetime.now()
+        test_loss, test_accuracy, test_precision, test_recall = run_eval_epoch(model=model, data=test_data,  gradient_accumulation_steps=1, device=device)
+        inf_end = datetime.now()
+        wandb.log(
+            {"time/inference": str(inf_end - inf_start), "time/training": str(train_end - train_start)})
 if __name__ == "__main__": 
-    batch_size = 1
+    batch_size = 4
     device = "cuda:3" 
 
-    name = f'modernBert'
-    wandb_run = wandb.init(
-        project="ModernBert",
-        name=name,
-        # Track hyperparameters and run metadata
-    )
-    main(batch_size, device)
 
+    lr = 1e-5
+    wd = 1e-4
+    run_id = 0
+
+    for i in range(1):
+        name = f"ModernBert-lr{lr}-wd{wd}"
+        wandb_run = wandb.init(
+        project="modernBert",
+        name=name,
+            config={
+                "learning_rate": lr,
+                "weight_decay": wd,
+            }
+        )
+        logging.info(f"Running {name}")
+        main(batch_size, device, lr, wd)  # You can make batch_size and device configurable too
+        logging.info("Done with main")
+        wandb_run.finish()
+        run_id += 1
